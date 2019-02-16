@@ -75,6 +75,7 @@ static const GLchar *f_shader_template =
   "  return texture2D(to, vec2(uv.x, 1.0 - uv.y));\n"
   "}\n"
   "\n"
+  "#line 0 0\n"
   "\n%s\n"
   "void main() {\n"
   "  gl_FragColor = transition(_uv);\n"
@@ -139,6 +140,7 @@ FRAMESYNC_DEFINE_CLASS(gltransition, GLTransitionContext, fs);
 
 static GLuint build_shader(AVFilterContext *ctx, const GLchar *shader_source, GLenum type)
 {
+  GLint status;
   GLuint shader = glCreateShader(type);
   if (!shader || !glIsShader(shader)) {
     return 0;
@@ -147,34 +149,42 @@ static GLuint build_shader(AVFilterContext *ctx, const GLchar *shader_source, GL
   glShaderSource(shader, 1, &shader_source, 0);
   glCompileShader(shader);
 
-  GLint status;
   glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
+
+  if (status != GL_TRUE) {
+    char log[10000];
+    glGetShaderInfoLog(shader, sizeof(log), NULL, log);
+    av_log(ctx, AV_LOG_ERROR, "invalid shader: %s\n", log);
+  }
 
   return (status == GL_TRUE ? shader : 0);
 }
 
 static int build_program(AVFilterContext *ctx)
 {
+  GLint status;
   GLuint v_shader, f_shader;
   GLTransitionContext *c = ctx->priv;
+  char *source = NULL;
+  const char * transition_source;
+  int len;
 
   if (!(v_shader = build_shader(ctx, v_shader_source, GL_VERTEX_SHADER))) {
-    av_log(ctx, AV_LOG_ERROR, "invalid vertex shader\n");
     return -1;
   }
 
-  char *source = NULL;
 
   if (c->source) {
     FILE *f = fopen(c->source, "rb");
-
+    unsigned long fsize;
+    
     if (!f) {
       av_log(ctx, AV_LOG_ERROR, "invalid transition source file \"%s\"\n", c->source);
       return -1;
     }
 
     fseek(f, 0, SEEK_END);
-    unsigned long fsize = ftell(f);
+    fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
 
     source = malloc(fsize + 1);
@@ -184,9 +194,9 @@ static int build_program(AVFilterContext *ctx)
     source[fsize] = 0;
   }
 
-  const char *transition_source = source ? source : f_default_transition_source;
+  transition_source = source ? source : f_default_transition_source;
 
-  int len = strlen(f_shader_template) + strlen(transition_source);
+  len = strlen(f_shader_template) + strlen(transition_source);
   c->f_shader_source = av_calloc(len, sizeof(*c->f_shader_source));
   if (!c->f_shader_source) {
     return AVERROR(ENOMEM);
@@ -201,27 +211,32 @@ static int build_program(AVFilterContext *ctx)
   }
 
   if (!(f_shader = build_shader(ctx, c->f_shader_source, GL_FRAGMENT_SHADER))) {
-    av_log(ctx, AV_LOG_ERROR, "invalid fragment shader\n");
     return -1;
   }
-
+  
   c->program = glCreateProgram();
   glAttachShader(c->program, v_shader);
   glAttachShader(c->program, f_shader);
   glLinkProgram(c->program);
 
-  GLint status;
   glGetProgramiv(c->program, GL_LINK_STATUS, &status);
+  if (status != GL_TRUE) {
+    char log[10000];
+    glGetProgramInfoLog(c->program, sizeof(log), NULL, log);
+    av_log(ctx, AV_LOG_ERROR, "invalid program: %s\n", log);
+  }
   return status == GL_TRUE ? 0 : -1;
 }
 
 static void setup_vbo(GLTransitionContext *c)
 {
+  GLint loc;
+  
   glGenBuffers(1, &c->posBuf);
   glBindBuffer(GL_ARRAY_BUFFER, c->posBuf);
   glBufferData(GL_ARRAY_BUFFER, sizeof(position), position, GL_STATIC_DRAW);
 
-  GLint loc = glGetAttribLocation(c->program, "position");
+  loc = glGetAttribLocation(c->program, "position");
   glEnableVertexAttribArray(loc);
   glVertexAttribPointer(loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
 }
@@ -262,6 +277,102 @@ static void setup_tex(AVFilterLink *fromLink)
   }
 }
 
+static int streq(const char * s1, const char * s2) {
+  return s1 && s2 && !strcmp(s1,s2);
+}
+
+static void setup_init_uniforms(AVFilterLink *fromLink)
+{
+  AVFilterContext     *ctx = fromLink->dst;
+  GLTransitionContext *c = ctx->priv;
+  char * src = strdup(c->f_shader_source);
+  char * st;
+  char * line;
+  line = strtok_r(src, "\r\n", &st);  
+  while (line) {
+#define WHITE " \t"
+    char * ist;
+    char * start = strtok_r(line, WHITE, &ist);
+    char * type = strtok_r(NULL, WHITE, &ist);
+    char * name = strtok_r(NULL, WHITE ";", &ist); 
+    char * comm = strtok_r(NULL, WHITE, &ist);
+    char * eq = strtok_r(NULL, WHITE, &ist);
+    char * val = strtok_r(NULL, WHITE ";", &ist);
+    (void)comm;
+    (void)start;
+    av_log(ctx, AV_LOG_DEBUG, "start %s type %s name %s comm %s eq %s val %s\n", start, type, name, comm, eq, val);
+    if (streq(start, "uniform") && val) {
+      GLint loc;
+      loc = glGetUniformLocation(c->program, name);
+      if (loc < 0)
+	  av_log(ctx, AV_LOG_ERROR, "no uniform named %s\n", name);
+      else if (streq(type, "bool")) {
+	if (av_match_name(val, "true,1"))
+	  glUniform1i(loc, 1);
+	else if (av_match_name(val, "false,0"))
+	  glUniform1i(loc, 0);
+	else
+	  av_log(ctx, AV_LOG_ERROR, "parsing bool %s for uniform %s\n", val, name);
+      }
+      else if (streq(type, "int")) {
+	int v;
+	if (1 == sscanf(val, "%d", &v))
+	  glUniform1i(loc, v);
+	else
+	  av_log(ctx, AV_LOG_ERROR, "parsing integer %s for uniform %s\n", val, name);
+      }
+      else if (streq(type, "float")) {
+	float v;
+	if (1 == sscanf(val, "%f", &v))
+	  glUniform1f(loc, v);
+	else
+	  av_log(ctx, AV_LOG_ERROR, "parsing float %s for uniform %s\n", val, name);
+      }
+      else if (streq(type, "ivec2")) {
+	int x,y;
+	if (2 == sscanf(val, "ivec2(%d,%d)", &x, &y))
+	  glUniform2i(loc, x, x);
+	else if (1 == sscanf(val, "ivec2(%d)", &x))
+	  glUniform2i(loc, x, x);
+	else
+	  av_log(ctx, AV_LOG_ERROR, "parsing ivec2 %s for uniform %s\n", val, name);
+      }
+      else if (streq(type, "vec2")) {
+	float x,y;
+	if (2 == sscanf(val, "vec2(%f,%f)", &x, &y))
+	  glUniform2f(loc, x, x);
+	else if (1 == sscanf(val, "vec2(%f)", &x))
+	  glUniform2f(loc, x, x);
+	else
+	  av_log(ctx, AV_LOG_ERROR, "parsing vec2 %s for uniform %s\n", val, name);
+      }
+      else if (streq(type, "vec3")) {
+	float x,y,z;
+	if (3 == sscanf(val, "vec3(%f,%f,%f)", &x, &y, &z))
+	  glUniform3f(loc, x, y, z);
+	else if (1 == sscanf(val, "vec3(%f)", &x))
+	  glUniform3f(loc, x, x, x);
+	else
+	  av_log(ctx, AV_LOG_ERROR, "parsing vec3 %s for uniform %s\n", val, name);
+      }
+      else if (streq(type, "vec4")) {
+	float x,y,z,w;
+	if (4 == sscanf(val, "vec4(%f,%f,%f,%f)", &x, &y, &z, &w))
+	  glUniform4f(loc, x, y, z, w);
+	else if (1 == sscanf(val, "vec4(%f)", &x))
+	  glUniform4f(loc, x, x, x, x);
+	else
+	  av_log(ctx, AV_LOG_ERROR, "parsing vec4 %s for uniform %s\n", val, name);
+      }
+      else
+	av_log(ctx, AV_LOG_ERROR, "unrecognized type %s for uniform %s\n", type, name);
+    }
+    line = strtok_r(NULL, "\r\n", &st);
+  }
+  free(src);
+}
+
+
 static void setup_uniforms(AVFilterLink *fromLink)
 {
   AVFilterContext     *ctx = fromLink->dst;
@@ -284,6 +395,7 @@ static void setup_uniforms(AVFilterLink *fromLink)
 
 static int setup_gl(AVFilterLink *inLink)
 {
+  int ret;
   AVFilterContext *ctx = inLink->dst;
   GLTransitionContext *c = ctx->priv;
 
@@ -333,13 +445,13 @@ static int setup_gl(AVFilterLink *inLink)
 
   glViewport(0, 0, inLink->w, inLink->h);
 
-  int ret;
   if((ret = build_program(ctx)) < 0) {
     return ret;
   }
 
   glUseProgram(c->program);
   setup_vbo(c);
+  setup_init_uniforms(inLink);  
   setup_uniforms(inLink);
   setup_tex(inLink);
 
@@ -356,6 +468,8 @@ static AVFrame *apply_transition(FFFrameSync *fs,
   AVFilterLink *toLink = ctx->inputs[TO];
   AVFilterLink *outLink = ctx->outputs[0];
   AVFrame *outFrame;
+  float ts;
+  float progress;
 
   outFrame = ff_get_video_buffer(outLink, outLink->w, outLink->h);
   if (!outFrame) {
@@ -372,8 +486,8 @@ static AVFrame *apply_transition(FFFrameSync *fs,
 
   glUseProgram(c->program);
 
-  const float ts = ((fs->pts - c->first_pts) / (float)fs->time_base.den) - c->offset;
-  const float progress = FFMAX(0.0f, FFMIN(1.0f, ts / c->duration));
+  ts = ((fs->pts - c->first_pts) / (float)fs->time_base.den) - c->offset;
+  progress = FFMAX(0.0f, FFMIN(1.0f, ts / c->duration));
   // av_log(ctx, AV_LOG_ERROR, "transition '%s' %llu %f %f\n", c->source, fs->pts - c->first_pts, ts, progress);
   glUniform1f(c->progress, progress);
 
