@@ -5,6 +5,7 @@
  */
 
 #include "libavutil/opt.h"
+#include "libavutil/avstring.h"
 #include "internal.h"
 #include "framesync.h"
 
