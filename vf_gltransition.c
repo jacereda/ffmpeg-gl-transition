@@ -65,15 +65,15 @@ static const GLchar *f_shader_template =
   "uniform sampler2D to;\n"
   "uniform float progress;\n"
   "uniform float ratio;\n"
-  "uniform float _fromR;\n"
-  "uniform float _toR;\n"
+  "uniform mat3 mfrom;\n"
+  "uniform mat3 mto;\n"    
   "\n"
   "vec4 getFromColor(vec2 uv) {\n"
-  "  return texture2D(from, vec2(uv.x, 1.0 - uv.y));\n"
+  "  return texture2D(from, vec2(vec3(uv,1.) * mfrom));\n"
   "}\n"
   "\n"
   "vec4 getToColor(vec2 uv) {\n"
-  "  return texture2D(to, vec2(uv.x, 1.0 - uv.y));\n"
+  "  return texture2D(to, vec2(vec3(uv,1.) * mto));\n"
   "}\n"
   "\n"
   "#line 0 0\n"
@@ -92,6 +92,8 @@ static const GLchar *f_default_transition_source =
   "  );\n"
   "}\n";
 
+enum ResizeType { CONTAIN, COVER, STRETCH, RESIZES_NB };
+
 typedef struct {
   const AVClass *class;
   FFFrameSync fs;
@@ -99,8 +101,13 @@ typedef struct {
   // input options
   double duration;
   double offset;
+  ResizeType resize;
+  
   char *source;
 
+  // output options
+  unsigned w, h;
+  
   // timestamp of the first frame in the output, in the timebase units
   int64_t first_pts;
 
@@ -108,9 +115,6 @@ typedef struct {
   GLuint        from;
   GLuint        to;
   GLint         progress;
-  GLint         ratio;
-  GLint         _fromR;
-  GLint         _toR;
 
   // internal state
   GLuint        posBuf;
@@ -134,6 +138,12 @@ static const AVOption gltransition_options[] = {
   { "duration", "transition duration in seconds", OFFSET(duration), AV_OPT_TYPE_DOUBLE, {.dbl=1.0}, 0, DBL_MAX, FLAGS },
   { "offset", "delay before startingtransition in seconds", OFFSET(offset), AV_OPT_TYPE_DOUBLE, {.dbl=0.0}, 0, DBL_MAX, FLAGS },
   { "source", "path to the gl-transition source file (defaults to basic fade)", OFFSET(source), AV_OPT_TYPE_STRING, {.str = NULL}, CHAR_MIN, CHAR_MAX, FLAGS },
+  { "w", "Output video width", OFFSET(w),    AV_OPT_TYPE_INT, {.i64=0}, 0,8192, FLAGS },
+  { "h", "Output video height", OFFSET(h),    AV_OPT_TYPE_INT, {.i64=0}, 0,8192, FLAGS },
+  { "resize", "resize mode", OFFSET(resize), AV_OPT_TYPE_INT, {.i64=0}, 0, RESIZE_NB-1, FLAGS, "resize" },
+  { "contain", "contain", 0, AV_OPT_TYPE_CONST, {.i64=CONTAIN}, 0, 0, FLAGS, "resize" },
+  { "cover", "cover", 0, AV_OPT_TYPE_CONST, {.i64=COVER}, 0, 0, FLAGS, "resize" },
+  { "stretch", "stretch", 0, AV_OPT_TYPE_CONST, {.i64=STRETCH}, 0, 0, FLAGS, "resize" },  
   {NULL}
 };
 
@@ -229,63 +239,74 @@ static int build_program(AVFilterContext *ctx)
   return status == GL_TRUE ? 0 : -1;
 }
 
-static void setup_vbo(GLTransitionContext *c)
+static GLuint create_vbo(GLTransitionContext *c)
 {
   GLint loc;
-  
-  glGenBuffers(1, &c->posBuf);
-  glBindBuffer(GL_ARRAY_BUFFER, c->posBuf);
+  GLuint buf;
+  glGenBuffers(1, &buf);
+  glBindBuffer(GL_ARRAY_BUFFER, buf);
   glBufferData(GL_ARRAY_BUFFER, sizeof(position), position, GL_STATIC_DRAW);
 
   loc = glGetAttribLocation(c->program, "position");
   glEnableVertexAttribArray(loc);
   glVertexAttribPointer(loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
+  return buf;
 }
 
-static void setup_tex(AVFilterLink *fromLink)
-{
-  AVFilterContext     *ctx = fromLink->dst;
-  GLTransitionContext *c = ctx->priv;
+static GLuint create_tex(unsigned w, unsigned h) {
+  GLuint t;
+  glGenTextures(1, &t);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, t);
 
-  { // from
-    glGenTextures(1, &c->from);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, c->from);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, fromLink->w, fromLink->h, 0, PIXEL_FORMAT, GL_UNSIGNED_BYTE, NULL);
-
-    glUniform1i(glGetUniformLocation(c->program, "from"), 0);
-  }
-
-  { // to
-    glGenTextures(1, &c->to);
-    glActiveTexture(GL_TEXTURE0 + 1);
-    glBindTexture(GL_TEXTURE_2D, c->to);
-
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, fromLink->w, fromLink->h, 0, PIXEL_FORMAT, GL_UNSIGNED_BYTE, NULL);
-
-    glUniform1i(glGetUniformLocation(c->program, "to"), 1);
-  }
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, PIXEL_FORMAT, GL_UNSIGNED_BYTE, NULL);
+  return t;
 }
 
 static int streq(const char * s1, const char * s2) {
   return s1 && s2 && !strcmp(s1,s2);
 }
 
-static void setup_init_uniforms(AVFilterLink *fromLink)
+static void get_matrix(int method, float * m, float ratio, float xratio) {
+  float sx, sy;
+  memset(m, 0, 9*sizeof(float));
+  switch (method) {
+  case CONTAIN: 
+    sx = fmax(ratio/xratio, 1.f);
+    sy = fmax(xratio/ratio, 1.f); 
+    break;
+  case COVER:
+    sx = fmin(ratio/xratio, 1.f);
+    sy = fmin(xratio/ratio, 1.f);
+    break;
+  case STRETCH:
+    sx = 1;
+    sy = 1;
+    break;
+  }
+  m[0] = sx;
+  m[2] = -0.5 * sx + 0.5;
+  m[4] = -sy;
+  m[5] = 0.5 * sy + 0.5;
+  m[8] = 1;
+}
+
+static void init_uniforms(AVFilterContext * ctx)
 {
-  AVFilterContext     *ctx = fromLink->dst;
   GLTransitionContext *c = ctx->priv;
+  AVFilterLink *fromLink = ctx->inputs[FROM];
+  AVFilterLink *toLink = ctx->inputs[TO];
+  AVFilterLink *outLink = ctx->outputs[0];
+  float mfrom[9];
+  float mto[9];
+  float ratio = outLink->w / (float)outLink->h;
+  float fromR = fromLink->w / (float)fromLink->h;
+  float toR = toLink->w / (float)toLink->h;  
   char * src = strdup(c->f_shader_source);
   char * st;
   char * line;
@@ -371,92 +392,19 @@ static void setup_init_uniforms(AVFilterLink *fromLink)
     line = strtok_r(NULL, "\r\n", &st);
   }
   free(src);
-}
 
-
-static void setup_uniforms(AVFilterLink *fromLink)
-{
-  AVFilterContext     *ctx = fromLink->dst;
-  GLTransitionContext *c = ctx->priv;
-
+  glUniform1i(glGetUniformLocation(c->program, "from"), 0);
+  glUniform1i(glGetUniformLocation(c->program, "to"), 1);
+  
   c->progress = glGetUniformLocation(c->program, "progress");
   glUniform1f(c->progress, 0.0f);
 
-  // TODO: this should be output ratio
-  c->ratio = glGetUniformLocation(c->program, "ratio");
-  glUniform1f(c->ratio, fromLink->w / (float)fromLink->h);
+  glUniform1f(glGetUniformLocation(c->program, "ratio"), ratio);
 
-  c->_fromR = glGetUniformLocation(c->program, "_fromR");
-  glUniform1f(c->_fromR, fromLink->w / (float)fromLink->h);
-
-  // TODO: initialize this in config_props for "to" input
-  c->_toR = glGetUniformLocation(c->program, "_toR");
-  glUniform1f(c->_toR, fromLink->w / (float)fromLink->h);
-}
-
-static int setup_gl(AVFilterLink *inLink)
-{
-  int ret;
-  AVFilterContext *ctx = inLink->dst;
-  GLTransitionContext *c = ctx->priv;
-
-
-#ifdef GL_TRANSITION_USING_EGL
-  //init EGL
-  // 1. Initialize EGL
-  c->eglDpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-  EGLint major, minor;
-  eglInitialize(c->eglDpy, &major, &minor);
-  av_log(ctx, AV_LOG_DEBUG, "%d%d", major, minor);
-  // 2. Select an appropriate configuration
-  EGLint numConfigs;
-  EGLint pbufferAttribs[] = {
-      EGL_WIDTH,
-      inLink->w,
-      EGL_HEIGHT,
-      inLink->h,
-      EGL_NONE,
-  };
-  eglChooseConfig(c->eglDpy, configAttribs, &c->eglCfg, 1, &numConfigs);
-  // 3. Create a surface
-  c->eglSurf = eglCreatePbufferSurface(c->eglDpy, c->eglCfg,
-                                       pbufferAttribs);
-  // 4. Bind the API
-  eglBindAPI(EGL_OPENGL_API);
-  // 5. Create a context and make it current
-  c->eglCtx = eglCreateContext(c->eglDpy, c->eglCfg, EGL_NO_CONTEXT, NULL);
-  eglMakeCurrent(c->eglDpy, c->eglSurf, c->eglSurf, c->eglCtx);
-#else
-  //glfw
-
-  glfwWindowHint(GLFW_VISIBLE, 0);
-  c->window = glfwCreateWindow(inLink->w, inLink->h, "", NULL, NULL);
-  if (!c->window) {
-    av_log(ctx, AV_LOG_ERROR, "setup_gl ERROR");
-    return -1;
-  }
-  glfwMakeContextCurrent(c->window);
-
-#endif
-
-#ifndef __APPLE__
-  glewExperimental = GL_TRUE;
-  glewInit();
-#endif
-
-  glViewport(0, 0, inLink->w, inLink->h);
-
-  if((ret = build_program(ctx)) < 0) {
-    return ret;
-  }
-
-  glUseProgram(c->program);
-  setup_vbo(c);
-  setup_init_uniforms(inLink);  
-  setup_uniforms(inLink);
-  setup_tex(inLink);
-
-  return 0;
+  get_matrix(c->resize, mfrom, ratio, fromR);
+  glUniformMatrix3fv(glGetUniformLocation(c->program, "mfrom"), 1, GL_FALSE, mfrom);
+  get_matrix(c->resize, mto, ratio, toR);    
+  glUniformMatrix3fv(glGetUniformLocation(c->program, "mto"), 1, GL_FALSE, mto);  
 }
 
 static AVFrame *apply_transition(FFFrameSync *fs,
@@ -494,15 +442,27 @@ static AVFrame *apply_transition(FFFrameSync *fs,
 
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, c->from);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  glPixelStorei(GL_UNPACK_ROW_LENGTH, fromFrame->linesize[0]/3);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, fromLink->w, fromLink->h, 0, PIXEL_FORMAT, GL_UNSIGNED_BYTE, fromFrame->data[0]);
-
+  
   glActiveTexture(GL_TEXTURE0 + 1);
   glBindTexture(GL_TEXTURE_2D, c->to);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  glPixelStorei(GL_UNPACK_ROW_LENGTH, toFrame->linesize[0]/3);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, toLink->w, toLink->h, 0, PIXEL_FORMAT, GL_UNSIGNED_BYTE, toFrame->data[0]);
 
   glDrawArrays(GL_TRIANGLES, 0, 6);
-  glReadPixels(0, 0, outLink->w, outLink->h, PIXEL_FORMAT, GL_UNSIGNED_BYTE, (GLvoid *)outFrame->data[0]);
+  glPixelStorei(GL_PACK_ALIGNMENT, 1);
+  glPixelStorei(GL_PACK_ROW_LENGTH, outFrame->linesize[0]/3);
+  glReadPixels(0, 0, outLink->w, outLink->h, PIXEL_FORMAT, GL_UNSIGNED_BYTE, outFrame->data[0]);
 
+
+  av_log(ctx, AV_LOG_DEBUG, "linesize %d %d %d\n", fromFrame->linesize[0], toFrame->linesize[0], outFrame->linesize[0]);
+  av_log(ctx, AV_LOG_DEBUG, "frame: %dx%d %dx%d %dx%d\n", fromLink->w, fromLink->h, toLink->w, toLink->h, outLink->w, outLink->h);
+
+  av_log(ctx, AV_LOG_DEBUG, "frame2: %dx%d %dx%d %dx%d\n", fromFrame->width, fromFrame->height, toFrame->width, toFrame->height, outFrame->width, outFrame->height);  
+  
   av_frame_free(&fromFrame);
 
   return outFrame;
@@ -543,35 +503,28 @@ static av_cold int init(AVFilterContext *ctx)
   c->fs.on_event = blend_frame;
   c->first_pts = AV_NOPTS_VALUE;
 
-
-#ifndef GL_TRANSITION_USING_EGL
-  if (!glfwInit())
-  {
-    return -1;
-  }
-#endif
-
   return 0;
 }
 
 static av_cold void uninit(AVFilterContext *ctx) {
   GLTransitionContext *c = ctx->priv;
   ff_framesync_uninit(&c->fs);
-
+  
+  if (c->from)
+    glDeleteTextures(1, &c->from);
+  if (c->to)
+    glDeleteTextures(1, &c->to);
+  if (c->posBuf)
+    glDeleteBuffers(1, &c->posBuf);
+  if (c->program)
+    glDeleteProgram(c->program);
+  
 #ifdef GL_TRANSITION_USING_EGL
   if (c->eglDpy) {
-    glDeleteTextures(1, &c->from);
-    glDeleteTextures(1, &c->to);
-    glDeleteBuffers(1, &c->posBuf);
-    glDeleteProgram(c->program);
     eglTerminate(c->eglDpy);
   }
 #else
   if (c->window) {
-    glDeleteTextures(1, &c->from);
-    glDeleteTextures(1, &c->to);
-    glDeleteBuffers(1, &c->posBuf);
-    glDeleteProgram(c->program);
     glfwDestroyWindow(c->window);
   }
 #endif
@@ -610,24 +563,79 @@ static int config_output(AVFilterLink *outLink)
     return AVERROR(EINVAL);
   }
 
-  if (fromLink->w != toLink->w || fromLink->h != toLink->h) {
-    av_log(ctx, AV_LOG_ERROR, "First input link %s parameters "
-           "(size %dx%d) do not match the corresponding "
-           "second input link %s parameters (size %dx%d)\n",
-           ctx->input_pads[FROM].name, fromLink->w, fromLink->h,
-           ctx->input_pads[TO].name, toLink->w, toLink->h);
+  if (c->w <= 0 || c->h <= 0) {
+    av_log(ctx, AV_LOG_ERROR, "width and height parameters must be set\n");
     return AVERROR(EINVAL);
   }
 
-  outLink->w = fromLink->w;
-  outLink->h = fromLink->h;
+  outLink->w = c->w;
+  outLink->h = c->h;
   // outLink->time_base = fromLink->time_base;
   outLink->frame_rate = fromLink->frame_rate;
+
+#ifdef GL_TRANSITION_USING_EGL
+  //init EGL
+  // 1. Initialize EGL
+  c->eglDpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+  EGLint major, minor;
+  eglInitialize(c->eglDpy, &major, &minor);
+  av_log(ctx, AV_LOG_DEBUG, "%d%d", major, minor);
+  
+  // 2. Select an appropriate configuration  
+  EGLint numConfigs;
+  EGLint pbufferAttribs[] = {
+      EGL_WIDTH, outLink->w,
+      EGL_HEIGHT, outLink->h,
+      EGL_NONE,
+  };
+  eglChooseConfig(c->eglDpy, configAttribs, &c->eglCfg, 1, &numConfigs);
+  // 3. Create a surface
+  c->eglSurf = eglCreatePbufferSurface(c->eglDpy, c->eglCfg,
+                                       pbufferAttribs);
+  // 4. Bind the API
+  eglBindAPI(EGL_OPENGL_API);
+  // 5. Create a context and make it current
+  c->eglCtx = eglCreateContext(c->eglDpy, c->eglCfg, EGL_NO_CONTEXT, NULL);
+  eglMakeCurrent(c->eglDpy, c->eglSurf, c->eglSurf, c->eglCtx);
+#else
+  //glfw
+  if (!glfwInit())
+  {
+    return -1;
+  }
+  glfwWindowHint(GLFW_VISIBLE, 0);
+
+  c->window = glfwCreateWindow(outLink->w, outLink->h, "", NULL, NULL);
+  if (!c->window) {
+    av_log(ctx, AV_LOG_ERROR, "setup_gl ERROR\n");
+    return -1;
+  }
+  glfwMakeContextCurrent(c->window);
+
+#endif
+
+#ifndef __APPLE__
+  glewExperimental = GL_TRUE;
+  glewInit();
+#endif
+
+  glViewport(0, 0, outLink->w, outLink->h);
+  
+  if((ret = build_program(ctx)) < 0) {
+    return ret;
+  }
+  glUseProgram(c->program);
+  c->posBuf = create_vbo(c);
+  init_uniforms(ctx);
+
+  c->from = create_tex(fromLink->w, fromLink->h);
+  c->to = create_tex(toLink->w, toLink->h);  
 
   if ((ret = ff_framesync_init_dualinput(&c->fs, ctx)) < 0) {
     return ret;
   }
-
+  av_log(ctx, AV_LOG_DEBUG, "ok: %d %d %dx%d %dx%d %dx%d\n", c->from, c->to, fromLink->w, fromLink->h, toLink->w, toLink->h, outLink->w, outLink->h);
+  
   return ff_framesync_configure(&c->fs);
 }
 
@@ -635,7 +643,6 @@ static const AVFilterPad gltransition_inputs[] = {
   {
     .name = "from",
     .type = AVMEDIA_TYPE_VIDEO,
-    .config_props = setup_gl,
   },
   {
     .name = "to",
