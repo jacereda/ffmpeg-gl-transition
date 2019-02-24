@@ -92,7 +92,7 @@ static const GLchar *f_default_transition_source =
   "  );\n"
   "}\n";
 
-enum ResizeType { CONTAIN, COVER, STRETCH, RESIZES_NB };
+enum ResizeType { CONTAIN, COVER, STRETCH, RESIZE_NB };
 
 typedef struct {
   const AVClass *class;
@@ -101,7 +101,7 @@ typedef struct {
   // input options
   double duration;
   double offset;
-  ResizeType resize;
+  enum ResizeType resize;
   
   char *source;
 
