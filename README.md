@@ -96,19 +96,18 @@ git apply ~/ffmpeg-gl-transition/ffmpeg.diff
 Non-EGL:
 ```base
 ./configure --enable-libx264 --enable-gpl --enable-opengl \
-            --enable-filter=gltransition --extra-libs='-lGLEW -lglfw'
+            --enable-filter=gltransition
 make
 ```
 
 EGL:
 ```base
-./configure ... --extra-libs='-lGLEW -lEGL'
+./configure ...
 make
 ```
 
 Notes:
 - See the official ffmpeg [compilation guide](https://trac.ffmpeg.org/wiki/CompilationGuide) for help building ffmpeg on your platform. I've thoroughly tested this filter on macOS Sierra ([macOS compilation guide](https://trac.ffmpeg.org/wiki/CompilationGuide/macOS)).
-- Depending on your platform, there may be slight variations in how [GLEW](http://glew.sourceforge.net/) and [glfw](http://www.glfw.org/) are named (with regard to `--extra-libs`, above), e.g. `-lglew` or `-lglfw3` - check `pkg-config`.
 - The above example builds a minimal ffmpeg binary with libx264, but there's nothing codec-specific about the filter itself, so feel free to add or remove any of ffmpeg's bells and whistles.
 
 Here's an example of a more full-featured build configuration:
@@ -118,7 +117,7 @@ Here's an example of a more full-featured build configuration:
   --enable-libfdk-aac --enable-libfreetype --enable-libmp3lame --enable-libtheora \
   --enable-libvorbis --enable-libvpx --enable-libx264 --enable-libx265 \
   --enable-libopus --enable-libxvid \
-  --enable-opengl --enable-filter=gltransition --extra-libs='-lGLEW -lglfw'
+  --enable-opengl --enable-filter=gltransition
 ```
 
 You can verify that the `gltransition` filter is available via:
