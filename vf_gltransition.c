@@ -603,7 +603,7 @@ static int config_output(AVFilterLink *outLink)
   {
     return -1;
   }
-  glfwWindowHint(GLFW_VISIBLE, 0);
+  glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
 
   c->window = glfwCreateWindow(outLink->w, outLink->h, "", NULL, NULL);
   if (!c->window) {

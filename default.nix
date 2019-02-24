@@ -1,6 +1,6 @@
 { nixpkgs ?  import <nixpkgs> {}
 , useEGL ? true
-, ffmpeg ? nixpkgs.ffmpeg_4
+, ffmpeg ? nixpkgs.ffmpeg-full
 }:
 with nixpkgs;
 let egldef = if useEGL then "define" else "undef";
